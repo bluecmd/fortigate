@@ -1,0 +1,254 @@
+#!/usr/bin/env python3
+"""Fortigate certificate updater module."""
+# Copyright (c) 2020, Christian Svensson
+# All rights reserved.
+#
+# Redistribution and use in source and binary forms, with or without
+# modification, are permitted provided that the following conditions are met:
+#     * Redistributions of source code must retain the above copyright
+#       notice, this list of conditions and the following disclaimer.
+#     * Redistributions in binary form must reproduce the above copyright
+#       notice, this list of conditions and the following disclaimer in the
+#       documentation and/or other materials provided with the distribution.
+#     * Neither the name of the <organization> nor the
+#       names of its contributors may be used to endorse or promote products
+#       derived from this software without specific prior written permission.
+#
+# THIS SOFTWARE IS PROVIDED BY THE COPYRIGHT HOLDERS AND CONTRIBUTORS "AS IS" AND
+# ANY EXPRESS OR IMPLIED WARRANTIES, INCLUDING, BUT NOT LIMITED TO, THE IMPLIED
+# WARRANTIES OF MERCHANTABILITY AND FITNESS FOR A PARTICULAR PURPOSE ARE
+# DISCLAIMED. IN NO EVENT SHALL <COPYRIGHT HOLDER> BE LIABLE FOR ANY
+# DIRECT, INDIRECT, INCIDENTAL, SPECIAL, EXEMPLARY, OR CONSEQUENTIAL DAMAGES
+# (INCLUDING, BUT NOT LIMITED TO, PROCUREMENT OF SUBSTITUTE GOODS OR SERVICES;
+# LOSS OF USE, DATA, OR PROFITS; OR BUSINESS INTERRUPTION) HOWEVER CAUSED AND
+# ON ANY THEORY OF LIABILITY, WHETHER IN CONTRACT, STRICT LIABILITY, OR TORT
+# (INCLUDING NEGLIGENCE OR OTHERWISE) ARISING IN ANY WAY OUT OF THE USE OF THIS
+# SOFTWARE, EVEN IF ADVISED OF THE POSSIBILITY OF SUCH DAMAGE.
+#
+# Based upon https://www.ultraviolet.network/post/let-s-encrypt-with-fortigate
+#
+# To use this script, make sure to create an API user that has the following profile:
+# config system accprofile
+#     edit "certificate_update"
+#         set scope global
+#         set sysgrp custom
+#         set vpngrp read-write
+#         config sysgrp-permission
+#             set cfg read-write
+#         end
+#     next
+# end
+#
+# NOTE: If you're using VDOMs it appears the "scope global" can only be done
+# from the CLI. In my own setup, I have an API user that is assigned to the "root"
+# management VDOM and things are working.
+# I have not tested this without VDOMs, but I assume everything Just Works (TM)
+#
+# To use with certbot, you can use something like this:
+#
+# certbot certonly [..] \
+#   --post-hook 'update-fortigate-cert \
+#     --hostname my-fortigate.home.network \
+#     --api-key-file /home/certer/fortigate.apikey \
+#     --cert /home/certer/certbot/live/my-fortigate.home.network/cert.pem \
+#     --privkey /home/certer/certbot/live/my-fortigate.home.network/privkey.pem \
+#     --chain /home/certer/certbot/live/my-fortigate.home.network/chain.pem'
+#
+# Remember to add a cronjob to renew, like:
+# 1 */12 * * * certbot renew -n -q
+#
+# That should be it. The script will update the certificates and remove old ones
+# automatically.
+
+import argparse
+import base64
+import datetime
+import time
+import urllib.parse
+
+import requests
+
+
+class Error(Exception):
+    """Module error class."""
+
+
+class ApiRequestError(Error):
+    """The API request did not go as expected."""
+
+
+class Fortigate:
+    """Representing a Fortigate to perform certificate operations upon."""
+
+    def __init__(self, hostname, api_key):
+        self._api_key = api_key
+        self._hostname = hostname
+
+    def _api(self, url, **kwargs):
+        """Construct an API URL."""
+        kwargs['access_token'] = self._api_key
+        args = urllib.parse.urlencode(kwargs)
+        return "https://{}/api/v2/{}?{}".format(self._hostname, url, args)
+
+    def import_intermediate_ca(self, cert, verify=True):
+        """Upload intermediate.
+
+        If we do not upload the intermediate Fortigate will not present the chain to the connecting
+        user - even if we chose to upload the fullchain.pem file as the certificate.
+        I haven't seen this behaviour in other products, but hey - it's pretty useful.
+
+        If the certificate is already present, this request fails using response 500 and
+        internal error -328 ("Certificate file is duplicated for CA/LOCAL/REMOTE/CRL cert.").
+        """
+        url = self._api("monitor/vpn-certificate/ca/import")
+        ca_post_body = {
+            "file_content": base64.b64encode(cert).decode(),
+            "scope": "global",
+            "import_method": "file",
+        }
+        response = requests.post(url, json=ca_post_body, verify=verify)
+        if (response.status_code != 200 and response.status_code != 500) or \
+                response.json()["error"] != -328:
+            raise ApiRequestError(
+                "Failed to upload intermediate CA, the details are:\n {}".format(response.text))
+
+    def certificate_exists(self, name, verify=True):
+        """Check and see if the certificate exists."""
+        url = self._api("cmdb/certificate/local/{}".format(name))
+        response = requests.get(url, verify=verify)
+        if response.status_code == 200:
+            return True
+        if response.status_code == 404:
+            return False
+        raise ApiRequestError(
+            "Failed to look for certificate, the details are:\n {}".format(response.text))
+
+    def delete_certificate(self, name, verify=True):
+        """Delete a certificate."""
+        url = self._api("cmdb/certificate/local/{}".format(name))
+        response = requests.delete(url, verify=verify)
+        if response.status_code != 200:
+            raise ApiRequestError(
+                "Failed to delete certificate, the details are:\n {}".format(response.text))
+
+    def import_leaf_certificate(self, name, cert, key, verify=True):
+        """Import local leaf certificate."""
+        url = self._api("monitor/vpn-certificate/local/import")
+        cert_post_body = {
+            "file_content": base64.b64encode(cert).decode(),
+            "key_file_content": base64.b64encode(key).decode(),
+            "type": "regular",
+            "scope": "global",
+            "certname": name,
+        }
+        response = requests.post(url, json=cert_post_body, verify=verify)
+        if response.status_code != 200:
+            raise ApiRequestError(
+                "Failed to upload new certificate, the details are:\n {}".format(response.text))
+
+    def set_https_mgmt_certificate(self, name, verify=True):
+        """Updates the Fortigate configuration to use a named certificate for HTTPS management."""
+        url = self._api("cmdb/system/global")
+        set_default_body = {'admin-server-cert': name}
+        try:
+            response = requests.put(url, json=set_default_body, verify=verify)
+            if response.status_code != 200:
+                raise ApiRequestError(
+                    "Failed to set default certificate, the details are:\n {}".format(
+                        response.text))
+        except requests.exceptions.ConnectionError:
+            # The connection is often closed when the setting is updated,
+            # so assume this means a success
+            pass
+
+    def get_https_mgmt_certificate(self, verify=True):
+        """Retrieve the name of the certificate used for HTTPS management."""
+        url = self._api("cmdb/system/global")
+        response = requests.get(url, verify=verify)
+        if response.status_code != 200:
+            raise ApiRequestError(
+                "Failed to get default certificate, the details are:\n {}".format(response.text))
+        if "admin-server-cert" not in response.json()["results"]:
+            raise ApiRequestError(
+                "Default certificate setting not present in response document.")
+        return response.json()["results"]["admin-server-cert"]
+
+    def get_expired_certificates(self, verify=True):
+        """Iterate over certificate names that have expired."""
+        url = self._api("monitor/system/available-certificates", scope="global")
+        response = requests.get(url, verify=verify)
+        if response.status_code != 200:
+            raise ApiRequestError(
+                "Failed to list certificates, the details are:\n {}".format(response.text))
+        now = int(time.time())
+        for result in response.json()["results"]:
+            remaining = result["valid_to"] - now
+            if remaining < 0:
+                yield result["name"]
+
+
+def _main():
+    parser = argparse.ArgumentParser(description="Manage Fortigate certificates")
+    required = parser.add_argument_group("required arguments")
+    required.add_argument(
+        "-H", "--hostname", required=True,
+        help="Fortigate hostname")
+    required.add_argument(
+        "-A", "--api-key-file", required=True,
+        help="File containing the API key to use to connect to the Fortigate")
+    parser.add_argument(
+        "-V", "--no-verify", action="store_true",
+        help="Do not verify the initial certificate when connecting to the Fortigate (INSECURE!)")
+    required.add_argument(
+        "-c", "--cert", metavar="PEM", required=True,
+        help="PEM file containing the certificate to import")
+    required.add_argument(
+        "-p", "--privkey", metavar="PEM", required=True,
+        help="PEM file containing the private key to import")
+    parser.add_argument(
+        "-C", "--chain", metavar="PEM",
+        help="PEM file containing an intermediate certificate to import")
+    parser.add_argument(
+        "-N", "--cert-name-format", metavar="FORMAT", default="LetsEncrypt-%Y-%m-%d",
+        help="Name format to upload certificate as")
+    parser.add_argument(
+        "-P", "--prune-prefix", metavar="TEXT", default="LetsEncrypt-",
+        help="Remove certificates that have expired if they have this prefix (empty = disable)")
+    args = parser.parse_args()
+
+    api_key = open(args.api_key_file, "r").read().strip()
+    forti = Fortigate(args.hostname, api_key)
+    cert_ca = open(args.chain, "rb").read()   # Only support a single intermediate CA for now
+    cert_leaf = open(args.cert, "rb").read()
+    cert_privkey = open(args.privkey, "rb").read()
+    setup_verify_cert = not args.no_verify
+    cert_name = datetime.datetime.now().strftime(args.cert_name_format)
+    prune_prefix = args.prune_prefix
+
+    # Import and set the HTTPS certificate to be used
+    forti.import_intermediate_ca(cert_ca, verify=setup_verify_cert)
+    if not forti.certificate_exists(cert_name, verify=setup_verify_cert):
+        forti.import_leaf_certificate(cert_name, cert_leaf, cert_privkey, verify=setup_verify_cert)
+    forti.set_https_mgmt_certificate(cert_name, verify=setup_verify_cert)
+
+    # Use certificate verification to test connection for real now
+    if not forti.get_https_mgmt_certificate() == cert_name:
+        raise Error("Read-back validation of HTTPS management certificate failed")
+
+    if prune_prefix == "":
+        return
+
+    # Remove old expired certificates matching our prune prefix
+    for cert in forti.get_expired_certificates():
+        if cert.startswith(prune_prefix):
+            # Try to remove expired certificates, but do it best-effort and ignore errors.
+            # Errors might be related to the certificate being in use for example, which
+            # requires an operator to fix anyway and is easy to spot in the Fortigate web UI.
+            try:
+                forti.delete_certificate(cert)
+            except ApiRequestError:
+                pass
+    # All good!
+
+if __name__ == "__main__":
+    _main()
